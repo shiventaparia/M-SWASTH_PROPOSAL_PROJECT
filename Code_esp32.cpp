@@ -1,164 +1,285 @@
 /*
- * =====================================================================
- * ESP32 + MPU6050: Real-Time Complementary Filter Gait & Peak Angle Tracker
- * With Hardware Handshake (WHO_AM_I) & Auto-Zero Calibration
- * Project: SIH 2026 - AI-Assisted Osteoarthritis Screening System
- * =====================================================================
- */
+  ================================================================
+  KNEE OA IMU DATA LOGGER — STAGE 1: RAW ACQUISITION
+  ================================================================
+  Hardware:
+    - ESP32 DevKit V1 (ESP32-WROOM)
+    - MPU6050 #1 "THIGH" on I2C address 0x68 (AD0 -> GND)
+    - MPU6050 #2 "SHIN"  on I2C address 0x69 (AD0 -> 3.3V)
+    - Both sensors share ONE I2C bus: SDA = GPIO 21, SCL = GPIO 22
+
+  Output: CSV over USB serial at 115200 baud, ~100 Hz.
+  Header:
+    sample,timestamp_ms,thigh_ax,thigh_ay,thigh_az,thigh_gx,thigh_gy,thigh_gz,
+    shin_ax,shin_ay,shin_az,shin_gx,shin_gy,shin_gz
+
+  Units:
+    Acceleration: m/s^2
+    Angular velocity: deg/s
+
+  Explicitly NOT implemented in this stage (by design):
+    knee angle, Euler/quaternion fusion, Madgwick/Mahony/Kalman filters,
+    ROM, gait/step/sit-to-stand/squat detection, ML/classification,
+    Wi-Fi/Bluetooth/web server/mobile app.
+  These come in later stages, on top of this raw data stream.
+  ================================================================
+*/
+
 #include <Wire.h>
-#define MPU_ADDR 0x68
-#define WHO_AM_I_REG 0x75
-// Complementary Filter & Timing Settings
-const float ALPHA = 0.98;           // 98% Gyro, 2% Accel
-const unsigned long DT_MS = 10;     // 10 ms = 100 Hz
-const float DT_SEC = 0.01;
-const float GYRO_SCALE = 65.5;      // For ±500 deg/s
-const float ACCEL_SCALE = 4096.0;   // For ±8g
-// Calibration offset
-float gyro_z_bias = 0.0;
-// Tracking Variables
-float current_angle = 0.0;
-float peak_angle = 0.0;
-float peak_timestamp = 0.0;
-unsigned long last_sample_time = 0;
-float last_strike_time = 0.0;
-int stride_count = 0;
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+// ---------------- Configuration ----------------
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+#define THIGH_ADDR 0x68
+#define SHIN_ADDR  0x69
+
+#define SAMPLE_PERIOD_US 10000UL   // 100 Hz -> 10 ms -> 10000 us
+
+#define DEBUG_MODE 0               // 1 = extra human-readable prints mixed with clear markers, 0 = clean CSV only
+
+#define CALIBRATE_ON_STARTUP 1     // set to 0 to skip gyro bias calibration
+#define CALIBRATION_SAMPLES 200    // ~2 seconds at 100 Hz
+
+// ---------------- Globals ----------------
+Adafruit_MPU6050 thighSensor;
+Adafruit_MPU6050 shinSensor;
+
+bool thighOK = false;
+bool shinOK = false;
+
+uint32_t sampleIndex = 0;
+uint64_t nextSampleMicros = 0;
+uint32_t startMillis = 0;
+
+// Gyro bias (deg/s), applied as: corrected = raw - bias
+float thighGyroBias[3] = {0, 0, 0};
+float shinGyroBias[3]  = {0, 0, 0};
+
+// ---------------- Function prototypes ----------------
+void scanI2C();
+bool initializeSensors();
+void calibrateGyroscope();
+void printCSVHeader();
+void readAndPrintSample();
+
+// ================================================================
 void setup() {
   Serial.begin(115200);
-  delay(1000); // Allow serial monitor to open
-  Serial.println("\n==================================================");
-  Serial.println("   ESP32 + MPU6050 Gait & Peak Angle Analyzer     ");
-  Serial.println("==================================================");
-  Wire.begin(21, 22); // ESP32 pins: SDA=GPIO 21, SCL=GPIO 22
-  Wire.setClock(400000); // Fast I2C (400 kHz)
-  // -------------------------------------------------------------
-  // 1. HARDWARE DETECTION CHECK (WHO_AM_I Register 0x75)
-  // -------------------------------------------------------------
-  Serial.print("[1/3] Detecting MPU6050 on I2C bus... ");
-  
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(WHO_AM_I_REG);
-  byte error = Wire.endTransmission(false);
-  
-  if (error != 0) {
-    Serial.println("\n[FAILED] I2C Connection Error!");
-    Serial.println(">>> CHECK WIRING: VCC -> 3.3V, GND -> GND, SDA -> GPIO 21, SCL -> GPIO 22");
-    while (1); // Halt execution
+  delay(300); // let USB serial settle
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("KNEE OA IMU DATA LOGGER");
+  Serial.println("================================");
+  Serial.println();
+  Serial.println("Initializing I2C...");
+  Serial.println("SDA: GPIO 21");
+  Serial.println("SCL: GPIO 22");
+  Serial.println();
+
+  Wire.begin(SDA_PIN, SCL_PIN);   // explicit pins, never the default Wire.begin()
+
+  scanI2C();
+
+  bool sensorsReady = initializeSensors();
+
+  if (!sensorsReady) {
+    Serial.println();
+    Serial.println("One or both sensors failed to initialize. Halting.");
+    Serial.println("Fix wiring/power and reset the ESP32.");
+    while (true) {
+      delay(1000); // stop here — do not silently continue as if working
+    }
   }
-  Wire.requestFrom(MPU_ADDR, 1);
-  byte chip_id = Wire.read();
-  if (chip_id == 0x68 || chip_id == 0x70 || chip_id == 0x72) {
-    Serial.print("FOUND! (Device ID: 0x");
-    Serial.print(chip_id, HEX);
-    Serial.println(")");
-  } else {
-    Serial.print("\n[FAILED] Unknown Chip ID: 0x");
-    Serial.println(chip_id, HEX);
-    Serial.println(">>> Make sure AD0 pin is connected to GND.");
-    while (1); // Halt execution
-  }
-  // -------------------------------------------------------------
-  // 2. CONFIGURE REGISTERS
-  // -------------------------------------------------------------
-  // Wake up MPU6050
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x6B);
-  Wire.write(0x00);
-  Wire.endTransmission(true);
-  // Set Accelerometer to ±8g (Register 0x1C = 0x10)
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x1C);
-  Wire.write(0x10);
-  Wire.endTransmission(true);
-  // Set Gyroscope to ±500 deg/s (Register 0x1B = 0x08)
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x1B);
-  Wire.write(0x08);
-  Wire.endTransmission(true);
-  // -------------------------------------------------------------
-  // 3. AUTO-CALIBRATE GYROSCOPE ZERO-BIAS (Keep leg still)
-  // -------------------------------------------------------------
-  Serial.println("[2/3] Calibrating Gyroscope... KEEP LEG STILL for 2 seconds!");
-  float sum_gz = 0.0;
-  const int CALIB_SAMPLES = 200;
-  for (int i = 0; i < CALIB_SAMPLES; i++) {
-    int16_t ax, ay, az, gx, gy, gz;
-    readMPU(ax, ay, az, gx, gy, gz);
-    sum_gz += ((float)gz / GYRO_SCALE);
-    delay(10);
-  }
-  gyro_z_bias = sum_gz / CALIB_SAMPLES;
-  Serial.print("      Calibration Complete! Gyro Bias: ");
-  Serial.print(gyro_z_bias, 3);
-  Serial.println(" deg/s");
-  // Initial angle from gravity
-  int16_t ax, ay, az, gx, gy, gz;
-  readMPU(ax, ay, az, gx, gy, gz);
-  current_angle = atan2((float)az, (float)-ax) * 180.0 / PI;
-  Serial.println("[3/3] SYSTEM READY! You can start walking now.\n");
-  Serial.println("-------------------------------------------------------------------------");
-  Serial.println("Stride_#  |  Peak_Angle (deg)  |  Stride_Duration (s)  |  Peak_Time (s)");
-  Serial.println("-------------------------------------------------------------------------");
-  last_sample_time = millis();
-  last_strike_time = millis() / 1000.0;
+
+#if CALIBRATE_ON_STARTUP
+  calibrateGyroscope();
+#endif
+
+  Serial.println();
+  Serial.println("Starting data acquisition...");
+  Serial.println("================================");
+  Serial.println();
+
+  printCSVHeader();
+
+  startMillis = millis();
+  nextSampleMicros = micros();
 }
+
+// ================================================================
 void loop() {
-  unsigned long now = millis();
-  if (now - last_sample_time >= DT_MS) {
-    last_sample_time = now;
-    float current_time_sec = now / 1000.0;
-    int16_t raw_ax, raw_ay, raw_az, raw_gx, raw_gy, raw_gz;
-    readMPU(raw_ax, raw_ay, raw_az, raw_gx, raw_gy, raw_gz);
-    float ax_g = (float)raw_ax / ACCEL_SCALE;
-    float ay_g = (float)raw_ay / ACCEL_SCALE;
-    float az_g = (float)raw_az / ACCEL_SCALE;
-    
-    // Subtract calibrated zero-bias so gyro never drifts
-    float gz_degs = ((float)raw_gz / GYRO_SCALE) - gyro_z_bias;
-    // Pitch from gravity
-    float acc_angle = atan2(az_g, -ax_g) * 180.0 / PI;
-    // Complementary Filter
-    current_angle = ALPHA * (current_angle + gz_degs * DT_SEC) + (1.0 - ALPHA) * acc_angle;
-    float leg_angle = abs(current_angle);
-    // Track the Peak Angle during swing
-    if (leg_angle > peak_angle) {
-      peak_angle = leg_angle;
-      peak_timestamp = current_time_sec;
-    }
-    // Heel Strike Impact Shock
-    float impact_mag_g = sqrt(ax_g * ax_g + ay_g * ay_g + az_g * az_g);
-    float time_since_last_strike = current_time_sec - last_strike_time;
-    // Completed Stride Trigger
-    if (impact_mag_g > 1.8 && peak_angle > 20.0 && time_since_last_strike > 0.65) {
-      stride_count++;
-      float stride_duration = time_since_last_strike;
-      last_strike_time = current_time_sec;
-      // Print clean, formatted stride result
-      Serial.print("Stride ");
-      if (stride_count < 10) Serial.print(" ");
-      Serial.print(stride_count);
-      Serial.print("   |  ");
-      Serial.print(peak_angle, 2);
-      Serial.print(" deg          |  ");
-      Serial.print(stride_duration, 3);
-      Serial.print(" s              |  ");
-      Serial.print(peak_timestamp, 2);
-      Serial.println(" s");
-      // Reset for next stride
-      peak_angle = 0.0;
+  uint64_t nowMicros = micros();
+
+  if ((int64_t)(nowMicros - nextSampleMicros) >= 0) {
+    readAndPrintSample();
+    sampleIndex++;
+    nextSampleMicros += SAMPLE_PERIOD_US;
+
+    // If we fell far behind (e.g. during calibration/startup jitter),
+    // resync instead of trying to "catch up" with a burst of samples.
+    if ((int64_t)(nowMicros - nextSampleMicros) > (int64_t)SAMPLE_PERIOD_US) {
+      nextSampleMicros = nowMicros + SAMPLE_PERIOD_US;
     }
   }
 }
-void readMPU(int16_t &ax, int16_t &ay, int16_t &az, int16_t &gx, int16_t &gy, int16_t &gz) {
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x3B);
-  Wire.endTransmission(false);
-  Wire.requestFrom(MPU_ADDR, 14, true);
-  ax = (Wire.read() << 8) | Wire.read();
-  ay = (Wire.read() << 8) | Wire.read();
-  az = (Wire.read() << 8) | Wire.read();
-  Wire.read(); Wire.read(); // Skip temperature bytes
-  gx = (Wire.read() << 8) | Wire.read();
-  gy = (Wire.read() << 8) | Wire.read();
-  gz = (Wire.read() << 8) | Wire.read();
+
+// ================================================================
+void scanI2C() {
+  Serial.println("Scanning I2C bus...");
+  Serial.println();
+
+  bool found68 = false;
+  bool found69 = false;
+
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    uint8_t error = Wire.endTransmission();
+    if (error == 0) {
+      Serial.print("Found device at 0x");
+      if (addr < 16) Serial.print("0");
+      Serial.println(addr, HEX);
+      if (addr == THIGH_ADDR) found68 = true;
+      if (addr == SHIN_ADDR)  found69 = true;
+    }
+  }
+
+  Serial.println();
+  if (!found68) {
+    Serial.println("ERROR: THIGH MPU6050 at 0x68 not detected.");
+  }
+  if (!found69) {
+    Serial.println("ERROR: SHIN MPU6050 at 0x69 not detected.");
+  }
+  Serial.println();
+}
+
+// ================================================================
+bool initializeSensors() {
+  // THIGH @ 0x68
+  thighOK = thighSensor.begin(THIGH_ADDR, &Wire, 0);
+  if (thighOK) {
+    // Ranges appropriate for walking / knee bending / sit-to-stand /
+    // squat-like movement — not extreme-impact sports:
+    //  - Accel: +/- 4g covers normal limb accelerations with headroom,
+    //    without sacrificing resolution the way +/-16g would.
+    //  - Gyro: +/- 500 deg/s comfortably covers knee flexion/extension
+    //    angular rates during normal daily activities.
+    //  - DLPF ~44 Hz (BAND_44_HZ) removes high-frequency vibration/noise
+    //    while preserving the low-frequency content of human movement
+    //    (well above the 100 Hz sample rate's Nyquist-relevant content).
+    thighSensor.setAccelerometerRange(MPU6050_RANGE_4_G);
+    thighSensor.setGyroRange(MPU6050_RANGE_500_DEG);
+    thighSensor.setFilterBandwidth(MPU6050_BAND_44_HZ);
+    Serial.println("THIGH MPU6050 [0x68]: OK");
+  } else {
+    Serial.println("THIGH MPU6050 [0x68]: FAILED (address seen but init failed, or not present)");
+  }
+
+  // SHIN @ 0x69
+  shinOK = shinSensor.begin(SHIN_ADDR, &Wire, 1);
+  if (shinOK) {
+    shinSensor.setAccelerometerRange(MPU6050_RANGE_4_G);
+    shinSensor.setGyroRange(MPU6050_RANGE_500_DEG);
+    shinSensor.setFilterBandwidth(MPU6050_BAND_44_HZ);
+    Serial.println("SHIN  MPU6050 [0x69]: OK");
+  } else {
+    Serial.println("SHIN  MPU6050 [0x69]: FAILED (address seen but init failed, or not present)");
+  }
+
+  return thighOK && shinOK;
+}
+
+// ================================================================
+void calibrateGyroscope() {
+  Serial.println();
+  Serial.println("Gyro bias calibration:");
+  Serial.println("Keep BOTH sensors completely still...");
+  delay(1500);
+
+  double sumThigh[3] = {0, 0, 0};
+  double sumShin[3]  = {0, 0, 0};
+
+  sensors_event_t a, g, temp;
+
+  for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
+    thighSensor.getEvent(&a, &g, &temp);
+    sumThigh[0] += g.gyro.x * RAD_TO_DEG;
+    sumThigh[1] += g.gyro.y * RAD_TO_DEG;
+    sumThigh[2] += g.gyro.z * RAD_TO_DEG;
+
+    shinSensor.getEvent(&a, &g, &temp);
+    sumShin[0] += g.gyro.x * RAD_TO_DEG;
+    sumShin[1] += g.gyro.y * RAD_TO_DEG;
+    sumShin[2] += g.gyro.z * RAD_TO_DEG;
+
+    delay(5);
+  }
+
+  for (int i = 0; i < 3; i++) {
+    thighGyroBias[i] = sumThigh[i] / CALIBRATION_SAMPLES;
+    shinGyroBias[i]  = sumShin[i]  / CALIBRATION_SAMPLES;
+  }
+
+  Serial.println("Calibration complete.");
+  Serial.print("THIGH gyro bias (deg/s): ");
+  Serial.print(thighGyroBias[0]); Serial.print(", ");
+  Serial.print(thighGyroBias[1]); Serial.print(", ");
+  Serial.println(thighGyroBias[2]);
+  Serial.print("SHIN  gyro bias (deg/s): ");
+  Serial.print(shinGyroBias[0]); Serial.print(", ");
+  Serial.print(shinGyroBias[1]); Serial.print(", ");
+  Serial.println(shinGyroBias[2]);
+}
+
+// ================================================================
+void printCSVHeader() {
+  Serial.println("sample,timestamp_ms,thigh_ax,thigh_ay,thigh_az,thigh_gx,thigh_gy,thigh_gz,shin_ax,shin_ay,shin_az,shin_gx,shin_gy,shin_gz");
+}
+
+// ================================================================
+void readAndPrintSample() {
+  sensors_event_t thighAccel, thighGyro, thighTemp;
+  sensors_event_t shinAccel, shinGyro, shinTemp;
+
+  // Sequential reads: THIGH first, then SHIN. At 100 Hz (10 ms period),
+  // the I2C read of each sensor takes on the order of a few hundred
+  // microseconds, so the time offset between the two reads is roughly
+  // 1-3% of the sample period — negligible for this stage, but worth
+  // knowing about if later stages need tighter cross-sensor timing.
+  thighSensor.getEvent(&thighAccel, &thighGyro, &thighTemp);
+  shinSensor.getEvent(&shinAccel, &shinGyro, &shinTemp);
+
+  float thigh_gx = (thighGyro.gyro.x * RAD_TO_DEG) - thighGyroBias[0];
+  float thigh_gy = (thighGyro.gyro.y * RAD_TO_DEG) - thighGyroBias[1];
+  float thigh_gz = (thighGyro.gyro.z * RAD_TO_DEG) - thighGyroBias[2];
+
+  float shin_gx = (shinGyro.gyro.x * RAD_TO_DEG) - shinGyroBias[0];
+  float shin_gy = (shinGyro.gyro.y * RAD_TO_DEG) - shinGyroBias[1];
+  float shin_gz = (shinGyro.gyro.z * RAD_TO_DEG) - shinGyroBias[2];
+
+  uint32_t timestamp_ms = millis() - startMillis;
+
+#if DEBUG_MODE
+  Serial.print("DEBUG: loop time us=");
+  Serial.println(micros());
+#endif
+
+  Serial.print(sampleIndex);        Serial.print(",");
+  Serial.print(timestamp_ms);       Serial.print(",");
+  Serial.print(thighAccel.acceleration.x, 4); Serial.print(",");
+  Serial.print(thighAccel.acceleration.y, 4); Serial.print(",");
+  Serial.print(thighAccel.acceleration.z, 4); Serial.print(",");
+  Serial.print(thigh_gx, 4); Serial.print(",");
+  Serial.print(thigh_gy, 4); Serial.print(",");
+  Serial.print(thigh_gz, 4); Serial.print(",");
+  Serial.print(shinAccel.acceleration.x, 4); Serial.print(",");
+  Serial.print(shinAccel.acceleration.y, 4); Serial.print(",");
+  Serial.print(shinAccel.acceleration.z, 4); Serial.print(",");
+  Serial.print(shin_gx, 4); Serial.print(",");
+  Serial.print(shin_gy, 4); Serial.print(",");
+  Serial.println(shin_gz, 4);
 }
