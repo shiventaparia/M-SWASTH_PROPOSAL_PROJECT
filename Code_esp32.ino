@@ -68,7 +68,7 @@ void readAndPrintSample();
 // ================================================================
 void setup() {
   Serial.begin(115200);
-  delay(300); // let USB serial settle
+  delay(300); 
 
   Serial.println();
   Serial.println("================================");
@@ -193,7 +193,6 @@ bool initializeSensors() {
   return thighOK && shinOK;
 }
 
-// ================================================================
 void calibrateGyroscope() {
   Serial.println();
   Serial.println("Gyro bias calibration:");
